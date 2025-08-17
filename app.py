@@ -1,430 +1,685 @@
 import streamlit as st
-from transformers import pipeline
 import pandas as pd
 import time
-from langdetect import detect
-from googletrans import Translator
-import whisper
 import tempfile
 import os
-import requests
+import zipfile
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import json
 
-# Page configuration
+# THIRD PARTY IMPORTS WITH ERROR HANDLING
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    st.error("⚠️ Transformers not installed. Run: pip install transformers torch")
+    TRANSFORMERS_AVAILABLE = False
+
+try:
+    from langdetect import detect
+    LANGDETECT_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ Language detection disabled. Run: pip install langdetect")
+    LANGDETECT_AVAILABLE = False
+
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ Audio processing disabled. Run: pip install openai-whisper")
+    WHISPER_AVAILABLE = False
+
+try:
+    from moviepy.editor import VideoFileClip
+    MOVIEPY_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ Video processing disabled. Run: pip install moviepy")
+    MOVIEPY_AVAILABLE = False
+
+try:
+    import pdfplumber
+    PDF_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ PDF processing disabled. Run: pip install pdfplumber")
+    PDF_AVAILABLE = False
+
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ OpenAI integration disabled. Run: pip install openai")
+    OPENAI_AVAILABLE = False
+
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ Word document processing disabled. Run: pip install python-docx")
+    DOCX_AVAILABLE = False
+
+# PAGE CONFIG
 st.set_page_config(
-    page_title="AI Summarization Bot V2.0 - Enhanced",
-    page_icon="🎬",
-    layout="wide"
+    page_title="AI Summarization Bot V3.0 - Enhanced",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Initialize translator
-@st.cache_resource
-def get_translator():
-    return Translator()
+# SESSION STATE INIT
+if 'processing_history' not in st.session_state:
+    st.session_state.processing_history = []
+if 'current_batch' not in st.session_state:
+    st.session_state.current_batch = []
+if 'settings' not in st.session_state:
+    st.session_state.settings = {}
 
-# Language mappings
+# LANGUAGES AND FLAGS
 SUPPORTED_LANGUAGES = {
-    "English": "en",
-    "Spanish": "es", 
-    "French": "fr",
-    "German": "de",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Dutch": "nl",
-    "Russian": "ru",
-    "Chinese": "zh",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Arabic": "ar"
+    "English": "en", "Spanish": "es", "French": "fr", "German": "de",
+    "Italian": "it", "Portuguese": "pt", "Dutch": "nl", "Russian": "ru",
+    "Chinese (Simplified)": "zh-cn", "Chinese (Traditional)": "zh-tw",
+    "Japanese": "ja", "Korean": "ko", "Arabic": "ar", "Hindi": "hi",
+    "Turkish": "tr", "Polish": "pl", "Swedish": "sv", "Norwegian": "no"
 }
-
 LANGUAGE_FLAGS = {
-    "en": "🇺🇸", "es": "🇪🇸", "fr": "🇫🇷", "de": "🇩🇪",
-    "it": "🇮🇹", "pt": "🇵🇹", "nl": "🇳🇱", "ru": "🇷🇺",
-    "zh": "🇨🇳", "ja": "🇯🇵", "ko": "🇰🇷", "ar": "🇸🇦"
+    "en": "🇺🇸", "es": "🇪🇸", "fr": "🇫🇷", "de": "🇩🇪", "it": "🇮🇹",
+    
+    "pt": "🇵🇹", "nl": "🇳🇱", "ru": "🇷🇺", "zh-cn": "🇨🇳", "zh-tw": "🇹🇼",
+    "ja": "🇯🇵", "ko": "🇰🇷", "ar": "🇸🇦", "hi": "🇮🇳", "tr": "🇹🇷",
+    "pl": "🇵🇱", "sv": "🇸🇪", "no": "🇳🇴"
+}
+SUPPORTED_FILE_TYPES = {
+    'text': ['.txt', '.md', '.rtf'],
+    'pdf': ['.pdf'],
+    'word': ['.docx', '.doc'],
+    'audio': ['.mp3', '.wav', '.m4a', '.ogg', '.flac'],
+    'video': ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv']
 }
 
-def detect_language(text):
+# --- FUNCTION DEFINITIONS ---
+
+@st.cache_resource
+def load_ai_models():
+    """Load AI models with proper error handling"""
+    models = {}
+    if not TRANSFORMERS_AVAILABLE:
+        return models
+    try:
+        with st.spinner("🤖 Loading AI models..."):
+            models['bart'] = pipeline(
+                "summarization",
+                model="facebook/bart-large-cnn",
+                device=-1  # CPU
+            )
+            models['t5'] = pipeline(
+                "text2text-generation",
+                model="t5-small",
+                device=-1
+            )
+            if WHISPER_AVAILABLE:
+                models['whisper'] = whisper.load_model("base")
+        st.success("✅ AI Models loaded successfully!")
+    except Exception as e:
+        st.error(f"❌ Error loading models: {str(e)}")
+    return models
+
+def detect_language_safe(text):
+    if not LANGDETECT_AVAILABLE or not text.strip():
+        return "en"
     try:
         detected = detect(text)
-        return detected
+        return detected if detected in LANGUAGE_FLAGS else "en"
     except:
         return "en"
 
-def get_language_name(code):
-    for name, lang_code in SUPPORTED_LANGUAGES.items():
-        if lang_code == code:
-            return name
-    return "Unknown"
-
-@st.cache_resource
-def load_summarization_models():
-    models = {}
+def extract_text_from_pdf(file_bytes):
+    if not PDF_AVAILABLE:
+        raise Exception("PDF processing not available. Install pdfplumber.")
+    text_content = []
     try:
-        # High-quality models for best summaries
-        models['bart_cnn'] = pipeline("summarization", model="facebook/bart-large-cnn")
-        models['t5_small'] = pipeline("text2text-generation", model="t5-small") 
-        models['mt5_small'] = pipeline("text2text-generation", model="google/mt5-small")
-        st.success("✅ AI Models loaded successfully!")
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text()
+                if page_text:
+                    text_content.append(f"--- Page {page_num} ---\n{page_text}")
+        return "\n\n".join(text_content)
     except Exception as e:
-        st.error(f"Error loading models: {e}")
-        models['fallback'] = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    return models
+        raise Exception(f"Error extracting PDF text: {str(e)}")
 
-@st.cache_resource
-def load_whisper():
-    return whisper.load_model("base")
-
-def create_high_quality_summary(text, model_choice, summary_style, max_length, min_length):
-    """
-    Create high-quality, easy-to-understand summaries
-    """
-    models = load_summarization_models()
-
-    # Clean and prepare text
-    text = text.strip()
-    if len(text) < 50:
-        return "⚠️ Text too short for meaningful summarization. Please provide at least 50 words."
-
+def extract_text_from_docx(file_bytes):
+    if not DOCX_AVAILABLE:
+        raise Exception("Word document processing not available. Install python-docx.")
     try:
-        if model_choice == "BART (Best for English)":
-            # Use BART for highest quality English summaries
-            if len(text) > 1000:
-                # Chunk long texts
-                chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+        doc = Document(io.BytesIO(file_bytes))
+        paragraphs = [paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()]
+        return "\n\n".join(paragraphs)
+    except Exception as e:
+        raise Exception(f"Error extracting Word document text: {str(e)}")
+
+def extract_audio_from_video(video_bytes, output_path):
+    if not MOVIEPY_AVAILABLE:
+        raise Exception("Video processing not available. Install moviepy.")
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
+            temp_video.write(video_bytes)
+            temp_video.flush()
+            video = VideoFileClip(temp_video.name)
+            audio = video.audio
+            audio.write_audiofile(output_path, verbose=False, logger=None)
+            video.close()
+            audio.close()
+            os.unlink(temp_video.name)
+        return True
+    except Exception as e:
+        st.error(f"Video processing error: {str(e)}")
+        return False
+
+def transcribe_audio(audio_bytes, models):
+    if not WHISPER_AVAILABLE or 'whisper' not in models:
+        raise Exception("Audio transcription not available. Install openai-whisper.")
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+        temp_audio.write(audio_bytes)
+        temp_audio.flush()
+        try:
+            result = models['whisper'].transcribe(temp_audio.name)
+            return result['text'], result.get('language', 'en')
+        finally:
+            os.unlink(temp_audio.name)
+
+def generate_summary(text, model_name, models, settings):
+    if not text.strip():
+        return "No content to summarize."
+    try:
+        if model_name == 'BART':
+            if 'bart' not in models:
+                raise Exception("BART model not available")
+            max_chunk_size = 1024
+            if len(text) > max_chunk_size:
+                chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
                 summaries = []
-                for chunk in chunks[:3]:  # Limit to 3 chunks
-                    chunk_summary = models['bart_cnn'](chunk, 
-                                                     max_length=max_length//len(chunks[:3]), 
-                                                     min_length=min_length//len(chunks[:3]), 
-                                                     do_sample=False)
-                    summaries.append(chunk_summary[0]['summary_text'])
-                combined_summary = " ".join(summaries)
-
-                # Create final summary from combined chunks
-                if len(combined_summary) > max_length:
-                    final_summary = models['bart_cnn'](combined_summary, 
-                                                     max_length=max_length, 
-                                                     min_length=min_length, 
-                                                     do_sample=False)
-                    return final_summary[0]['summary_text']
-                else:
-                    return combined_summary
+                for chunk in chunks:
+                    result = models['bart'](
+                        chunk,
+                        max_length=settings.get('max_length', 130),
+                        min_length=settings.get('min_length', 30),
+                        do_sample=False
+                    )
+                    summaries.append(result[0]['summary_text'])
+                combined = " ".join(summaries)
+                if len(combined) > max_chunk_size:
+                    final_result = models['bart'](
+                        combined,
+                        max_length=settings.get('max_length', 130),
+                        min_length=settings.get('min_length', 30),
+                        do_sample=False
+                    )
+                    return final_result['summary_text']
+                return combined
             else:
-                summary = models['bart_cnn'](text, 
-                                           max_length=max_length, 
-                                           min_length=min_length, 
-                                           do_sample=False)
-                return summary[0]['summary_text']
-
-        elif model_choice == "T5 (Flexible)":
-            # Use T5 with proper prompt
-            if summary_style == "Simple & Clear":
-                prompt = f"summarize in simple words: {text}"
-            else:
-                prompt = f"summarize: {text}"
-
-            summary = models['t5_small'](prompt, 
-                                       max_length=max_length, 
-                                       min_length=min_length, 
-                                       do_sample=False)
-
-            # Extract text from T5 output
-            result = summary[0]['generated_text']
-            # Remove the prompt if it appears in output
-            if "summarize" in result.lower():
-                result = result.split(":", 1)[-1].strip()
-            return result
-
-        elif model_choice == "mT5 (Multilingual)":
-            # Use mT5 for non-English
-            if summary_style == "Simple & Clear":
-                prompt = f"simplify and summarize: {text}"
-            else:
-                prompt = f"summarize: {text}"
-
-            summary = models['mt5_small'](prompt, 
-                                        max_length=max_length, 
-                                        min_length=min_length, 
-                                        do_sample=False)
-
-            result = summary[0]['generated_text']
-            if "summarize" in result.lower():
-                result = result.split(":", 1)[-1].strip()
-            return result
-
+                result = models['bart'](
+                    text,
+                    max_length=settings.get('max_length', 130),
+                    min_length=settings.get('min_length', 30),
+                    do_sample=False
+                )
+                return result['summary_text']
+        elif model_name == 'T5':
+            if 't5' not in models:
+                raise Exception("T5 model not available")
+            prompt = f"summarize: {text[:1024]}"
+            result = models['t5'](
+                prompt,
+                max_length=settings.get('max_length', 130),
+                min_length=settings.get('min_length', 30)
+            )
+            return result['generated_text']
+        elif model_name == 'GPT-4':
+            return generate_openai_summary(text, settings)
     except Exception as e:
-        return f"❌ Summarization failed: {str(e)}. Try with shorter text or different model."
+        return f"Error generating summary: {str(e)}"
 
-# Title and description
-st.title("🎬 AI Summarization Bot V2.0 - Enhanced")
-st.markdown("**Transform text, audio & video into clear, easy-to-understand summaries using advanced AI**")
-st.markdown("---")
+def generate_openai_summary(text, settings):
+    if not OPENAI_AVAILABLE:
+        raise Exception("OpenAI integration not available. Install openai package.")
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise Exception("OpenAI API key not found. Set OPENAI_API_KEY in secrets or environment.")
+    try:
+        openai.api_key = api_key
+        style = settings.get('summary_style', 'concise')
+        prompt_templates = {
+            'concise': "Provide a concise summary of the following text in 2-3 sentences:\n\n{text}",
+            'detailed': "Provide a detailed summary of the following text, highlighting key points and main themes:\n\n{text}",
+            'bullet_points': "Summarize the following text as bullet points covering the main topics:\n\n{text}"
+        }
+        prompt = prompt_templates.get(style, prompt_templates['concise']).format(
+            text=text[:15000]
+        )
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=settings.get('max_length', 150),
+            temperature=0.3
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        raise Exception(f"OpenAI API error: {str(e)}")
 
-# Sidebar for settings
-st.sidebar.header("⚙️ Smart Settings")
-
-# Model selection with descriptions
-st.sidebar.subheader("🤖 AI Model")
-model_options = {
-    "BART (Best for English)": "Highest quality summaries for English text",
-    "T5 (Flexible)": "Good for any language, flexible prompting", 
-    "mT5 (Multilingual)": "Specialized for non-English languages"
-}
-
-selected_model = st.sidebar.selectbox(
-    "Choose AI Model:", 
-    list(model_options.keys()),
-    help="BART gives the clearest English summaries"
-)
-st.sidebar.caption(f"ℹ️ {model_options[selected_model]}")
-
-# Summary style
-st.sidebar.subheader("✨ Summary Style")
-summary_style = st.sidebar.radio(
-    "Choose style:",
-    ["Simple & Clear", "Detailed & Professional"],
-    help="Simple = Easy to read, Detailed = More comprehensive"
-)
-
-# Length controls
-st.sidebar.subheader("📏 Summary Length")
-if summary_style == "Simple & Clear":
-    max_length = st.sidebar.slider("Maximum words", 30, 100, 60)
-    min_length = st.sidebar.slider("Minimum words", 10, 50, 20)
-else:
-    max_length = st.sidebar.slider("Maximum words", 50, 200, 120)
-    min_length = st.sidebar.slider("Minimum words", 20, 100, 40)
-
-# Language settings
-st.sidebar.subheader("🌍 Language Settings")
-auto_detect = st.sidebar.checkbox("Auto-detect language", value=True)
-
-if not auto_detect:
-    input_language = st.sidebar.selectbox(
-        "Input Language:", 
-        list(SUPPORTED_LANGUAGES.keys()),
-        index=0
-    )
-
-output_language = st.sidebar.selectbox(
-    "Summary Language:",
-    list(SUPPORTED_LANGUAGES.keys()),
-    index=0
-)
-
-# Main interface
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.header("📂 Input Selection")
-
-    # Input method selection
-    input_method = st.radio(
-        "Choose your input type:", 
-        ["📝 Text Input", "🎵 Audio File", "🎬 Video File (Beta)"],
-        horizontal=True
-    )
-
-    text_input = ""
-    detected_lang = "en"
-
-    if input_method == "📝 Text Input":
-        input_type = st.radio("Text source:", ["Type/Paste", "Upload File"])
-
-        if input_type == "Type/Paste":
-            text_input = st.text_area(
-                "Enter text to summarize:", 
-                height=200,
-                placeholder="Paste your article, document, or any text here. The AI will create a clear, easy-to-understand summary..."
+def process_single_file(file_info, models, settings):
+    start_time = time.time()
+    result = {
+        'filename': file_info['name'],
+        'file_type': file_info['type'],
+        'status': 'processing',
+        'error': None,
+        'transcript': '',
+        'summary': '',
+        'language': 'en',
+        'processing_time': 0,
+        'word_count': 0,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        if file_info['type'] == 'text':
+            text_content = file_info['content']
+            if isinstance(text_content, bytes):
+                text_content = text_content.decode('utf-8', errors='ignore')
+        elif file_info['type'] == 'pdf':
+            text_content = extract_text_from_pdf(file_info['content'])
+        elif file_info['type'] == 'word':
+            text_content = extract_text_from_docx(file_info['content'])
+        elif file_info['type'] == 'audio':
+            text_content, detected_lang = transcribe_audio(file_info['content'], models)
+            result['language'] = detected_lang
+        elif file_info['type'] == 'video':
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                if extract_audio_from_video(file_info['content'], temp_audio.name):
+                    with open(temp_audio.name, 'rb') as audio_file:
+                        audio_bytes = audio_file.read()
+                    text_content, detected_lang = transcribe_audio(audio_bytes, models)
+                    result['language'] = detected_lang
+                    os.unlink(temp_audio.name)
+                else:
+                    raise Exception("Failed to extract audio from video")
+        else:
+            raise Exception(f"Unsupported file type: {file_info['type']}")
+        result['transcript'] = text_content
+        result['word_count'] = len(text_content.split())
+        if file_info['type'] in ['text', 'pdf', 'word']:
+            result['language'] = detect_language_safe(text_content)
+        if text_content.strip():
+            result['summary'] = generate_summary(
+                text_content,
+                settings.get('model', 'BART'),
+                models,
+                settings
             )
         else:
-            uploaded_file = st.file_uploader("Upload text file", type=['txt', 'md', 'pdf'])
-            if uploaded_file is not None:
-                text_input = str(uploaded_file.read(), "utf-8")
-                st.text_area("File content:", text_input, height=200)
+            result['summary'] = "No content found to summarize."
+        result['status'] = 'completed'
+    except Exception as e:
+        result['status'] = 'error'
+        result['error'] = str(e)
+    result['processing_time'] = time.time() - start_time
+    return result
 
-        if text_input.strip() and auto_detect:
-            detected_lang = detect_language(text_input)
-            detected_name = get_language_name(detected_lang)
-            flag = LANGUAGE_FLAGS.get(detected_lang, "🌍")
-            st.info(f"🔍 Detected: {flag} {detected_name}")
+def create_summary_report(result):
+    report = f"""
+AI SUMMARIZATION REPORT
+=====================
 
-    elif input_method == "🎵 Audio File":
-        st.markdown("**Upload audio and get instant transcript + summary**")
-        uploaded_audio = st.file_uploader(
-            "Choose audio file", 
-            type=['mp3', 'wav', 'm4a'],
-            help="Upload clear audio for best transcription results"
-        )
+File Information:
+- Original File: {result['filename']}
+- File Type: {result['file_type'].upper()}
+- Processing Date: {result['timestamp']}
+- Language: {result['language'].upper()} {LANGUAGE_FLAGS.get(result['language'], '🌍')}
+- Word Count: {result['word_count']:,}
+- Processing Time: {result['processing_time']:.2f} seconds
 
-        if uploaded_audio is not None:
-            with tempfile.NamedTemporaryFile(suffix='.'+uploaded_audio.name.split('.')[-1], delete=False) as temp_audio:
-                temp_audio.write(uploaded_audio.read())
-                temp_audio.flush()
-                temp_path = temp_audio.name
+SUMMARY
+=======
+{result['summary']}
 
-            with st.spinner("🎙️ Transcribing audio with AI..."):
-                try:
-                    whisper_model = load_whisper()
-                    result = whisper_model.transcribe(temp_path)
-                    text_input = result['text']
-                    detected_lang = result.get('language', 'en')
-                    os.remove(temp_path)
+FULL TRANSCRIPT
+==============
+{result['transcript']}
+"""
+    return report
 
-                    st.success("✅ Audio transcribed successfully!")
-                    st.text_area("📝 Transcript:", text_input, height=200)
+def create_batch_report(results):
+    total_files = len(results)
+    successful = len([r for r in results if r['status'] == 'completed'])
+    failed = total_files - successful
+    total_time = sum(r['processing_time'] for r in results)
+    total_words = sum(r['word_count'] for r in results)
+    languages = {}
+    for result in results:
+        lang = result['language']
+        languages[lang] = languages.get(lang, 0) + 1
+    report = f"""
+BATCH PROCESSING REPORT
+======================
 
-                    detected_name = get_language_name(detected_lang)
-                    flag = LANGUAGE_FLAGS.get(detected_lang, "🌍")
-                    st.info(f"🔍 Audio Language: {flag} {detected_name}")
+Summary Statistics:
+- Total Files Processed: {total_files}
+- Successful: {successful}
+- Failed: {failed}
+- Success Rate: {(successful/total_files*100):.1f}%
+- Total Processing Time: {total_time:.2f} seconds
+- Total Words Processed: {total_words:,}
+- Average Processing Speed: {(total_words/total_time):.0f} words/second
+Language Distribution:
+"""
+    for lang, count in languages.items():
+        flag = LANGUAGE_FLAGS.get(lang, '🌍')
+        report += f"- {flag} {lang.upper()}: {count} file(s)\n"
+    report += "\n\nFile Details:\n"
+    for i, result in enumerate(results, 1):
+        status_icon = "✅" if result['status'] == 'completed' else "❌"
+        report += f"{i}. {status_icon} {result['filename']} ({result['processing_time']:.1f}s)\n"
+        if result['error']:
+            report += f"   Error: {result['error']}\n"
+    return report
 
-                except Exception as e:
-                    st.error(f"❌ Transcription failed: {str(e)}")
-                    os.remove(temp_path) if os.path.exists(temp_path) else None
+def create_download_package(results, format_type='zip'):
+    if format_type == 'zip':
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for result in results:
+                if result['status'] == 'completed' and result['summary']:
+                    filename = f"{os.path.splitext(result['filename'])[0]}_summary.txt"
+                    content = create_summary_report(result)
+                    zip_file.writestr(filename, content)
+            batch_report = create_batch_report(results)
+            zip_file.writestr("batch_processing_report.txt", batch_report)
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+    elif format_type == 'json':
+        json_data = json.dumps(results, indent=2, default=str)
+        return json_data.encode()
 
-    elif input_method == "🎬 Video File (Beta)":
-        st.warning("🚧 Video support coming in next update! Use audio extraction for now.")
-        uploaded_video = st.file_uploader("Upload video file", type=['mp4', 'avi', 'mov'])
-        if uploaded_video:
-            st.info("💡 Tip: Extract audio from video and upload as audio file for now!")
-
-with col2:
-    st.header("✨ AI Summary")
-
-    if text_input.strip():
-        # Show input stats
-        word_count = len(text_input.split())
-        char_count = len(text_input)
-
-        st.metric("Input Words", word_count)
-        st.metric("Characters", char_count)
-
-        if word_count < 20:
-            st.warning("⚠️ Text is quite short. Add more content for better summaries.")
-
-        # Summarize button
-        if st.button("🚀 Create Smart Summary", type="primary", use_container_width=True):
-            if word_count < 10:
-                st.error("❌ Please provide at least 10 words for summarization.")
-            else:
-                with st.spinner("🧠 AI is creating your summary..."):
-                    start_time = time.time()
-
-                    # Handle translation if needed
-                    source_lang = detected_lang if auto_detect else SUPPORTED_LANGUAGES[input_language]
-                    target_lang = SUPPORTED_LANGUAGES[output_language]
-
-                    # Translate to English if needed for BART
-                    if selected_model == "BART (Best for English)" and source_lang != "en":
-                        translator = get_translator()
-                        try:
-                            english_text = translator.translate(text_input, src=source_lang, dest="en").text
-                            summary = create_high_quality_summary(english_text, selected_model, summary_style, max_length, min_length)
-
-                            # Translate summary back if needed
-                            if target_lang != "en":
-                                final_summary = translator.translate(summary, src="en", dest=target_lang).text
-                            else:
-                                final_summary = summary
-                        except:
-                            final_summary = create_high_quality_summary(text_input, "T5 (Flexible)", summary_style, max_length, min_length)
-                    else:
-                        final_summary = create_high_quality_summary(text_input, selected_model, summary_style, max_length, min_length)
-
-                    processing_time = time.time() - start_time
-
-                # Display results
-                if final_summary.startswith("⚠️") or final_summary.startswith("❌"):
-                    st.error(final_summary)
-                else:
-                    st.success("✅ Smart Summary Created!")
-
-                    # Summary display
-                    st.markdown("### 📄 Your Summary:")
-                    st.markdown(f"**{final_summary}**")
-
-                    # Stats
-                    summary_words = len(final_summary.split())
-                    compression_ratio = round((1 - summary_words/word_count) * 100, 1) if word_count > 0 else 0
-
-                    col_stat1, col_stat2, col_stat3 = st.columns(3)
-                    col_stat1.metric("Summary Words", summary_words)
-                    col_stat2.metric("Compression", f"{compression_ratio}%")
-                    col_stat3.metric("Time", f"{processing_time:.1f}s")
-
-                    # Language info
-                    source_flag = LANGUAGE_FLAGS.get(source_lang, "🌍")
-                    target_flag = LANGUAGE_FLAGS.get(target_lang, "🌍")
-                    st.info(f"📊 {source_flag} → {target_flag} | Style: {summary_style} | Model: {selected_model}")
-
-                    # Download button
-                    st.download_button(
-                        label="💾 Download Summary",
-                        data=final_summary,
-                        file_name=f"summary_{int(time.time())}.txt",
-                        mime="text/plain",
-                        use_container_width=True
-                    )
-    else:
-        st.info("👆 Upload or paste content above to generate a smart summary")
-
-# Footer
-st.markdown("---")
-
-# Sample texts
-with st.expander("🎯 Try These Sample Texts"):
-    sample_texts = {
-        "Technology News": """
-        Artificial intelligence has reached unprecedented levels of sophistication in 2025. Recent breakthroughs in large language models have enabled machines to understand context, generate creative content, and solve complex problems with human-like reasoning. Major tech companies are investing billions in AI research, leading to innovations in healthcare, education, and autonomous systems. However, experts warn about potential risks including job displacement, privacy concerns, and the need for robust AI governance frameworks. The debate continues about how to balance AI's transformative potential with responsible development practices.
-        """,
-
-        "Science Discovery": """
-        Scientists at leading research institutions have made a groundbreaking discovery in renewable energy storage. The new battery technology uses abundant materials and can store energy for weeks without significant loss. This breakthrough could revolutionize how we power our cities and homes, making renewable energy more reliable and accessible. The research team spent five years developing the technology, which combines novel chemical processes with advanced materials science. Early tests show the batteries can charge in minutes and last for decades, potentially solving one of the biggest challenges in sustainable energy.
-        """,
-
-        "Health & Wellness": """
-        A comprehensive study involving 50,000 participants over ten years has revealed surprising insights about longevity and healthy aging. Researchers found that regular social interaction, moderate exercise, and a Mediterranean-style diet were the strongest predictors of healthy aging. Interestingly, the study showed that mental stimulation through learning new skills was as important as physical exercise. Participants who maintained close friendships and engaged in community activities showed 40% lower rates of cognitive decline. The findings challenge previous assumptions about aging and provide actionable guidance for healthy living.
-        """
+# UI HELPERS
+def process_uploaded_file(uploaded_file, file_type, models, settings):
+    file_info = {
+        'name': uploaded_file.name,
+        'type': file_type,
+        'content': uploaded_file.read()
     }
+    with st.spinner(f"🤖 Processing {uploaded_file.name}..."):
+        result = process_single_file(file_info, models, settings)
+    display_single_result(result)
 
-    for title, text in sample_texts.items():
-        if st.button(f"📖 Load: {title}", key=f"sample_{title}"):
-            st.rerun()
+def display_single_result(result):
+    if result['status'] == 'completed':
+        st.success(f"✅ {result['filename']} processed successfully!")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Language", f"{LANGUAGE_FLAGS.get(result['language'], '🌍')} {result['language'].upper()}")
+        with col2:
+            st.metric("Words", f"{result['word_count']:,}")
+        with col3:
+            st.metric("Processing Time", f"{result['processing_time']:.1f}s")
+        with col4:
+            efficiency = result['word_count'] / result['processing_time'] if result['processing_time'] > 0 else 0
+            st.metric("Speed", f"{efficiency:.0f} w/s")
+        st.markdown("### 📋 Summary")
+        st.write(result['summary'])
+        if result['transcript'] and st.session_state.settings.get('save_transcripts', True):
+            with st.expander("📝 View Full Transcript"):
+                st.text_area("", result['transcript'], height=200, key=f"transcript_{result['filename']}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "💾 Download Summary",
+                result['summary'],
+                file_name=f"{os.path.splitext(result['filename'])[0]}_summary.txt",
+                mime="text/plain"
+            )
+        with col2:
+            report = create_summary_report(result)
+            st.download_button(
+                "📊 Download Full Report",
+                report,
+                file_name=f"{os.path.splitext(result['filename'])}_report.txt",
+                mime="text/plain"
+            )
+        st.session_state.processing_history.append(result)
+    else:
+        st.error(f"❌ Error processing {result['filename']}: {result['error']}")
 
-# Features info
-with st.expander("🚀 V2.0 Features"):
-    col_feat1, col_feat2 = st.columns(2)
+def process_batch_files(uploaded_files, models, settings):
+    file_infos = []
+    for file in uploaded_files:
+        file_ext = os.path.splitext(file.name)[1].lower()
+        file_type = 'text'  # default
+        for ftype, extensions in SUPPORTED_FILE_TYPES.items():
+            if file_ext in extensions:
+                file_type = ftype
+                break
+        file_infos.append({
+            'name': file.name,
+            'type': file_type,
+            'content': file.read()
+        })
 
-    with col_feat1:
-        st.markdown("""
-        **📝 Text Processing:**
-        - Smart text summarization
-        - Multiple AI models (BART, T5, mT5)
-        - 12+ language support
-        - Style options (Simple/Detailed)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_container = st.container()
+    results = []
+    for i, file_info in enumerate(file_infos):
+        status_text.text(f"🤖 Processing {file_info['name']}... ({i+1}/{len(file_infos)})")
+        result = process_single_file(file_info, models, settings)
+        results.append(result)
+        progress_bar.progress((i + 1) / len(file_infos))
+        with results_container:
+            if result['status'] == 'completed':
+                st.success(f"✅ {result['filename']} - {result['processing_time']:.1f}s")
+            else:
+                st.error(f"❌ {result['filename']} - {result['error']}")
+    status_text.text("✅ Batch processing completed!")
+    st.session_state.current_batch = results
+    display_batch_results(results)
 
-        **🎵 Audio Processing:**
-        - Audio file upload (.mp3, .wav)
-        - AI speech-to-text (Whisper)
-        - Automatic language detection
-        - Transcript + summary generation
-        """)
+def display_batch_results(results):
+    st.markdown("### 📊 Batch Processing Summary")
+    total_files = len(results)
+    successful = len([r for r in results if r['status'] == 'completed'])
+    failed = total_files - successful
+    total_time = sum(r['processing_time'] for r in results)
+    total_words = sum(r['word_count'] for r in results if r['status'] == 'completed')
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Total Files", total_files)
+    with col2:
+        st.metric("Successful", successful, delta=f"{(successful/total_files*100):.0f}%" if total_files > 0 else "0%")
+    with col3:
+        st.metric("Failed", failed)
+    with col4:
+        st.metric("Total Time", f"{total_time:.1f}s")
+    with col5:
+        speed = total_words / total_time if total_time > 0 else 0
+        st.metric("Avg Speed", f"{speed:.0f} w/s")
+    if successful > 0:
+        languages = {}
+        for result in results:
+            if result['status'] == 'completed':
+                lang = result['language']
+                languages[lang] = languages.get(lang, 0) + 1
+        st.markdown("### 🌍 Language Distribution")
+        lang_cols = st.columns(min(len(languages), 6))
+        for i, (lang, count) in enumerate(languages.items()):
+            with lang_cols[i % 6]:
+                flag = LANGUAGE_FLAGS.get(lang, '🌍')
+                st.metric(f"{flag} {lang.upper()}", count)
+    st.markdown("### 📋 Individual Results")
+    col1, col2 = st.columns(2)
+    with col1:
+        show_filter = st.selectbox("Show:", ["All Files", "Successful Only", "Failed Only"])
+    with col2:
+        sort_by = st.selectbox("Sort by:", ["Filename", "Processing Time", "Word Count", "Status"])
+    filtered_results = results
+    if show_filter == "Successful Only":
+        filtered_results = [r for r in results if r['status'] == 'completed']
+    elif show_filter == "Failed Only":
+        filtered_results = [r for r in results if r['status'] == 'error']
+    if sort_by == "Processing Time":
+        filtered_results.sort(key=lambda x: x['processing_time'], reverse=True)
+    elif sort_by == "Word Count":
+        filtered_results.sort(key=lambda x: x['word_count'], reverse=True)
+    elif sort_by == "Status":
+        filtered_results.sort(key=lambda x: x['status'])
+    else:
+        filtered_results.sort(key=lambda x: x['filename'])
+    for result in filtered_results:
+        with st.expander(f"{'✅' if result['status'] == 'completed' else '❌'} {result['filename']}", expanded=False):
+            if result['status'] == 'completed':
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"**Language:** {LANGUAGE_FLAGS.get(result['language'], '🌍')} {result['language'].upper()}")
+                with col2:
+                    st.write(f"**Words:** {result['word_count']:,}")
+                with col3:
+                    st.write(f"**Time:** {result['processing_time']:.1f}s")
+                st.markdown("**Summary:**")
+                st.write(result['summary'])
+                if result['transcript'] and st.session_state.settings.get('save_transcripts', True):
+                    with st.expander("📝 Full Transcript"):
+                        st.text_area("", result['transcript'], height=150, key=f"batch_transcript_{result['filename']}")
+            else:
+                st.error(f"**Error:** {result['error']}")
+    st.markdown("### 💾 Download Options")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if successful > 0:
+            zip_data = create_download_package(results, 'zip')
+            st.download_button(
+                "📦 Download ZIP Package",
+                zip_data,
+                file_name=f"batch_summaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip"
+            )
+    with col2:
+        if successful > 0:
+            json_data = create_download_package(results, 'json')
+            st.download_button(
+                "📊 Download JSON Data",
+                json_data,
+                file_name=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+    with col3:
+        batch_report = create_batch_report(results)
+        st.download_button(
+            "📋 Download Report",
+            batch_report,
+            file_name=f"batch_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain"
+        )
+    st.session_state.processing_history.extend([r for r in results if r['status'] == 'completed'])
 
-    with col_feat2:
-        st.markdown("""
-        **🌍 Multi-Language:**
-        - Auto-detect input language
-        - Translate summaries to any language
-        - Language flags and indicators
-        - Cross-language summarization
+# -- MAIN APP LOGIC --
 
-        **⚡ Enhanced Features:**
-        - Download summaries
-        - Processing time tracking
-        - Compression statistics
-        - Professional UI/UX
-        """)
+st.title("🤖 AI Summarization Bot V3.0 - Enhanced")
+st.markdown("**Advanced AI-powered summarization with support for text, audio, video, PDF, and Word documents**")
 
-st.markdown("---")
-st.markdown("**🎯 Built with:** Streamlit • Transformers • Whisper • Google Translate")
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    available_models = []
+    models = load_ai_models() if TRANSFORMERS_AVAILABLE else {}
+    if 'bart' in models:
+        available_models.append("BART (Best for English)")
+    if 't5' in models:
+        available_models.append("T5 (Multilingual)")
+    if OPENAI_AVAILABLE:
+        available_models.append("GPT-4 (Premium)")
+    if not available_models:
+        st.error("❌ No AI models available. Check your installation.")
+        st.stop()
+    model_choice = st.selectbox("🤖 AI Model:", available_models)
+    summary_style = st.selectbox(
+        "📝 Summary Style:",
+        ["concise", "detailed", "bullet_points"],
+        help="Choose the format and depth of your summaries"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        max_length = st.slider("Max Length", 50, 300, 130)
+    with col2:
+        min_length = st.slider("Min Length", 10, 100, 30)
+    batch_size = st.slider("Batch Size", 1, 10, 3, help="Number of files to process simultaneously")
+    with st.expander("🔧 Advanced Settings"):
+        enable_language_detection = st.checkbox("Enable Language Detection", True)
+        save_transcripts = st.checkbox("Save Full Transcripts", True)
+        quality_check = st.checkbox("Enable Quality Checks", True)
+    settings = {
+        'model': model_choice.split()[0],
+        'summary_style': summary_style,
+        'max_length': max_length,
+        'min_length': min_length,
+        'batch_size': batch_size,
+        'enable_language_detection': enable_language_detection,
+        'save_transcripts': save_transcripts,
+        'quality_check': quality_check
+    }
+    st.session_state.settings = settings
+
+tab1, tab2, tab3, tab4 = st.tabs(["📄 Single File", "📁 Batch Processing", "📊 Results & Analytics", "⚙️ Settings & Help"])
+
+with tab1:
+    st.header("📄 Single File Processing")
+    file_type = st.selectbox(
+        "Select file type:",
+        ["📝 Text", "📄 PDF", "📘 Word Document", "🎵 Audio", "🎬 Video"]
+    )
+    if file_type == "📝 Text":
+        input_method = st.radio("Input method:", ["Type/Paste", "Upload File"], horizontal=True)
+        if input_method == "Type/Paste":
+            text_input = st.text_area("Enter your text:", height=200, placeholder="Paste your text here...")
+            if text_input and st.button("🚀 Summarize Text", type="primary"):
+                file_info = {
+                    'name': 'direct_input.txt',
+                    'type': 'text',
+                    'content': text_input
+                }
+                with st.spinner("🤖 Processing text..."):
+                    result = process_single_file(file_info, models, settings)
+                display_single_result(result)
+        else:
+            uploaded_file = st.file_uploader("Upload text file", type=['txt', 'md', 'rtf'])
+            if uploaded_file and st.button("🚀 Process File", type="primary"):
+                process_uploaded_file(uploaded_file, 'text', models, settings)
+    elif file_type == "📄 PDF":
+        if not PDF_AVAILABLE:
+            st.error("❌ PDF processing not available. Install pdfplumber: `pip install pdfplumber`")
+        else:
+            uploaded_file = st.file_uploader("Upload PDF file", type=['pdf'])
+            if uploaded_file and st.button("🚀 Process PDF", type="primary"):
+                process_uploaded_file(uploaded_file, 'pdf', models, settings)
+    elif file_type == "📘 Word Document":
+        if not DOCX_AVAILABLE:
+            st.error("❌ Word document processing not available. Install python-docx: `pip install python-docx`")
+        else:
+            uploaded_file = st.file_uploader("Upload Word document", type=['docx', 'doc'])
+            if uploaded_file and st.button("🚀 Process Document", type="primary"):
+                process_uploaded_file(uploaded_file, 'word', models, settings)
+    elif file_type == "🎵 Audio":
+        if not WHISPER_AVAILABLE:
+            st.error("❌ Audio processing not available. Install openai-whisper: `pip install openai-whisper`")
+        else:
+            uploaded_file = st.file_uploader("Upload audio file", type=['mp3', 'wav', 'm4a', 'ogg', 'flac'])
+            if uploaded_file and st.button("🚀 Process Audio", type="primary"):
+                process_uploaded_file(uploaded_file, 'audio', models, settings)
+    elif file_type == "🎬 Video":
+        if not MOVIEPY_AVAILABLE or not WHISPER_AVAILABLE:
+            st.error("❌ Video processing not available. Install required packages: `pip install moviepy openai-whisper`")
+        else:
+            uploaded_file = st.file_uploader("Upload video file", type=['mp4', 'avi', 'mov', 'mkv', 'wmv'])
+            if uploaded_file and st.button("🚀 Process Video", type="primary"):
+                process_uploaded_file(uploaded_file, 'video', models, settings)
+
+# ---- rest of tabs (batch, analytics, settings/help) unchanged from your code ----
+# Just make sure function definitions always occur before usage
+

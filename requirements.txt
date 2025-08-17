@@ -9,6 +9,9 @@ requests>=2.28.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
 openai-whisper>=20231117
-tempfile
+moviepy>=1.0.3
+zipfile-deflate64
+concurrent-futures
+threading
 openai-whisper
 # Note: 'tempfile' is a built-in Python module and does not need to be installed via pip.
